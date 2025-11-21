@@ -2,18 +2,17 @@ name: CI - build, scan, push
 
 on:
   push:
-    branches:
-      - main
+    branches: [ main ]
   workflow_dispatch:
 
 env:
   IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/mallu-baddie-sample
   IMAGE_TAG: ${{ github.sha }}
 
-# -------------------------------
-# 1) BUILD JOB
-# -------------------------------
 jobs:
+  # -------------------------------
+  # 1) BUILD - build image and upload as artifact (image.tar)
+  # -------------------------------
   build:
     runs-on: ubuntu-latest
     outputs:
@@ -23,29 +22,48 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v2
+      - name: Build image (docker build)
+        run: |
+          docker build -t "${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}" .
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v2
+      - name: List local images (debug)
+        run: docker images --format "table {{.Repository}}\t{{.Tag}}\t{{.ID}}\t{{.Size}}"
 
-      - name: Build Docker image (local)
-        uses: docker/build-push-action@v4
+      - name: Save image to tar
+        run: |
+          IMAGE="${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}"
+          docker save "$IMAGE" -o image.tar
+          ls -lh image.tar
+
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v4
         with:
-          context: .
-          push: false
-          tags: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
-          outputs: type=image,name=${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          name: built-image
+          path: image.tar
 
-# -------------------------------
-# 2) SCAN JOB
-# -------------------------------
+  # -------------------------------
+  # 2) SCAN - download artifact, load image, run Trivy
+  # -------------------------------
   scan:
     runs-on: ubuntu-latest
-    needs: build   # wait for build to finish
+    needs: build
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Download built image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: built-image
+          path: .
+
+      - name: Show downloaded files (debug)
+        run: ls -lh
+
+      - name: Load image into Docker
+        run: |
+          docker load -i image.tar
+          docker images --format "table {{.Repository}}\t{{.Tag}}\t{{.ID}}\t{{.Size}}"
 
       - name: Install Trivy
         run: |
@@ -56,26 +74,43 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y trivy
 
-      - name: Load Docker image
-        run: |
-          docker pull ${{ needs.build.outputs.image_name }}:${{ needs.build.outputs.image_tag }} || echo "Image should still be present locally"
-
       - name: Run Trivy image scan (fail on HIGH or CRITICAL)
+        id: trivy-scan
         run: |
-          IMAGE=${{ needs.build.outputs.image_name }}:${{ needs.build.outputs.image_tag }}
-          echo "Scanning $IMAGE..."
+          IMAGE="${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}"
+          echo "Scanning image: $IMAGE"
           trivy image --download-db-only
-          trivy image --exit-code 1 --severity CRITICAL,HIGH $IMAGE
+          # Save JSON and table output for easier debugging
+          trivy image --format json --output trivy-results.json --severity CRITICAL,HIGH,MEDIUM $IMAGE || true
+          trivy image --exit-code 1 --severity CRITICAL,HIGH --format table $IMAGE
+        # If this step exits non-zero because of CRITICAL/HIGH, the job will fail.
 
-# -------------------------------
-# 3) PUSH JOB
-# -------------------------------
+      - name: Upload Trivy JSON (artifact) for debugging
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-results
+          path: trivy-results.json
+
+  # -------------------------------
+  # 3) PUSH - push image to Docker Hub only if scan succeeded
+  # -------------------------------
   push:
     runs-on: ubuntu-latest
-    needs: scan   # push only if scan succeeded
+    needs: scan
+    if: ${{ needs.scan.result == 'success' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Download built image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: built-image
+          path: .
+
+      - name: Load image into Docker
+        run: docker load -i image.tar
 
       - name: Login to Docker Hub
         uses: docker/login-action@v2
@@ -83,11 +118,8 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build & Push image to Docker Hub
-        uses: docker/build-push-action@v4
-        with:
-          context: .
-          push: true
-          tags: |
-            ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
-            ${{ env.IMAGE_NAME }}:latest
+      - name: Tag & Push to Docker Hub
+        run: |
+          docker tag "${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}" "${{ env.IMAGE_NAME }}:latest"
+          docker push "${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}"
+          docker push "${{ env.IMAGE_NAME }}:latest"
