@@ -1,0 +1,93 @@
+name: CI - build, scan, push
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/mallu-baddie-sample
+  IMAGE_TAG: ${{ github.sha }}
+
+# -------------------------------
+# 1) BUILD JOB
+# -------------------------------
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ env.IMAGE_TAG }}
+      image_name: ${{ env.IMAGE_NAME }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Build Docker image (local)
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          push: false
+          tags: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          outputs: type=image,name=${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+
+# -------------------------------
+# 2) SCAN JOB
+# -------------------------------
+  scan:
+    runs-on: ubuntu-latest
+    needs: build   # wait for build to finish
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Trivy
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y wget apt-transport-https gnupg lsb-release
+          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
+          echo deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main | sudo tee /etc/apt/sources.list.d/trivy.list
+          sudo apt-get update -y
+          sudo apt-get install -y trivy
+
+      - name: Load Docker image
+        run: |
+          docker pull ${{ needs.build.outputs.image_name }}:${{ needs.build.outputs.image_tag }} || echo "Image should still be present locally"
+
+      - name: Run Trivy image scan (fail on HIGH or CRITICAL)
+        run: |
+          IMAGE=${{ needs.build.outputs.image_name }}:${{ needs.build.outputs.image_tag }}
+          echo "Scanning $IMAGE..."
+          trivy image --download-db-only
+          trivy image --exit-code 1 --severity CRITICAL,HIGH $IMAGE
+
+# -------------------------------
+# 3) PUSH JOB
+# -------------------------------
+  push:
+    runs-on: ubuntu-latest
+    needs: scan   # push only if scan succeeded
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build & Push image to Docker Hub
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+            ${{ env.IMAGE_NAME }}:latest
